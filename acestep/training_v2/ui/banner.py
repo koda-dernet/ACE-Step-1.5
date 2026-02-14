@@ -179,7 +179,7 @@ def show_banner(
         print(_pick_logo(), file=sys.stderr)
         print(f'  "{motto}"', file=sys.stderr)
         print(f"  Side-Step v{SIDESTEP_VERSION} -- Adapter Fine-Tuning CLI (LoRA + LoKR)", file=sys.stderr)
-        print(f"  Standalone: github.com/koda-dernet/Side-Step", file=sys.stderr)
+        print("  Standalone: github.com/koda-dernet/Side-Step", file=sys.stderr)
         print(f"  Mode   : {sub_desc}", file=sys.stderr)
         print(f"  Stack  : {ver_str}", file=sys.stderr)
         print(f"  GPU    : {gpu_line}", file=sys.stderr)

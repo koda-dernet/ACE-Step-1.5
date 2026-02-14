@@ -14,7 +14,7 @@ import logging
 import math
 import time
 from pathlib import Path
-from typing import Any, Dict, Generator, Optional
+from typing import Any, Dict, Generator, List, Optional, Tuple
 
 import torch
 
@@ -26,17 +26,68 @@ from acestep.training_v2.ui import TrainingUpdate
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Extracted helpers
+# ---------------------------------------------------------------------------
+
+def _flush_accumulated(
+    trainable_params: list,
+    optimizer: Any,
+    scheduler: Any,
+    accumulated_loss: float,
+    accumulation_step: int,
+    cfg: Any,
+    tb: TrainingLogger,
+    module: Any,
+    epoch: int,
+    global_step: int,
+    steps_per_epoch: int,
+) -> Tuple[int, float, List[TrainingUpdate]]:
+    """Clip gradients, step optimizer/scheduler, zero grads, and log.
+
+    Consolidates the duplicated optimizer-step sequence used both inside
+    the accumulation check and the end-of-epoch flush.
+
+    Returns:
+        ``(global_step, avg_loss, updates)`` where *updates* is a list
+        of ``TrainingUpdate`` objects the caller should yield.
+    """
+    torch.nn.utils.clip_grad_norm_(trainable_params, cfg.max_grad_norm)
+    optimizer.step()
+    scheduler.step()
+    optimizer.zero_grad(set_to_none=True)
+    global_step += 1
+
+    avg_loss = accumulated_loss * cfg.gradient_accumulation_steps / accumulation_step
+    _lr = scheduler.get_last_lr()[0]
+    updates: List[TrainingUpdate] = []
+
+    if global_step % cfg.log_every == 0:
+        tb.log_loss(avg_loss, global_step)
+        tb.log_lr(_lr, global_step)
+        updates.append(TrainingUpdate(
+            step=global_step, loss=avg_loss,
+            msg=f"Epoch {epoch + 1}, Step {global_step}, Loss: {avg_loss:.4f}",
+            kind="step", epoch=epoch + 1, max_epochs=cfg.max_epochs, lr=_lr,
+            steps_per_epoch=steps_per_epoch,
+        ))
+
+    if global_step % cfg.log_heavy_every == 0:
+        tb.log_per_layer_grad_norms(module.model, global_step)
+
+    return global_step, avg_loss, updates
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+
 def run_basic_training_loop(
     trainer: Any,
     data_module: Any,
     training_state: Optional[Dict[str, Any]],
 ) -> Generator[TrainingUpdate, None, None]:
     """Execute the basic (non-Fabric) training loop.
-
-    This is a standalone generator extracted from
-    ``FixedLoRATrainer._train_basic``.  It accesses trainer state via
-    the *trainer* parameter (e.g. ``trainer.module``,
-    ``trainer.training_config``, ``trainer._save_checkpoint``).
 
     Args:
         trainer: The ``FixedLoRATrainer`` instance.
@@ -77,10 +128,9 @@ def run_basic_training_loop(
     steps_per_epoch = max(1, math.ceil(len(train_loader) / cfg.gradient_accumulation_steps))
     total_steps = steps_per_epoch * cfg.max_epochs
 
-    scheduler_type = getattr(cfg, "scheduler_type", "cosine")
     scheduler = build_scheduler(
         optimizer,
-        scheduler_type=scheduler_type,
+        scheduler_type=getattr(cfg, "scheduler_type", "cosine"),
         total_steps=total_steps,
         warmup_steps=cfg.warmup_steps,
         lr=cfg.learning_rate,
@@ -89,9 +139,7 @@ def run_basic_training_loop(
 
     # -- Training memory features (same as Fabric path) ----------------
     if getattr(cfg, "gradient_checkpointing", True):
-        ckpt_ok, cache_off, grads_ok = configure_memory_features(
-            module.model.decoder
-        )
+        ckpt_ok, cache_off, grads_ok = configure_memory_features(module.model.decoder)
         module.force_input_grads_for_checkpointing = ckpt_ok
         if ckpt_ok:
             yield TrainingUpdate(
@@ -109,21 +157,16 @@ def run_basic_training_loop(
         try:
             yield TrainingUpdate(0, 0.0, f"[INFO] Loading checkpoint from {cfg.resume_from}", kind="info")
             from acestep.training_v2.trainer_helpers import resume_checkpoint
-            resumed = yield from resume_checkpoint(trainer,
-                cfg.resume_from, optimizer, scheduler,
-            )
+            resumed = yield from resume_checkpoint(trainer, cfg.resume_from, optimizer, scheduler)
             if resumed is not None:
                 start_epoch, global_step = resumed
         except Exception as exc:
             logger.exception("Failed to load checkpoint")
             yield TrainingUpdate(0, 0.0, f"[WARN] Checkpoint load failed: {exc} -- starting fresh", kind="warn")
-            start_epoch = 0
-            global_step = 0
 
     accumulation_step = 0
     accumulated_loss = 0.0
     optimizer.zero_grad(set_to_none=True)
-
     module.model.decoder.train()
 
     for epoch in range(start_epoch, cfg.max_epochs):
@@ -133,10 +176,7 @@ def run_basic_training_loop(
 
         for batch in train_loader:
             if training_state and training_state.get("should_stop", False):
-                _stop_loss = (
-                    accumulated_loss * cfg.gradient_accumulation_steps
-                    / max(accumulation_step, 1)
-                )
+                _stop_loss = accumulated_loss * cfg.gradient_accumulation_steps / max(accumulation_step, 1)
                 yield TrainingUpdate(global_step, _stop_loss, "[INFO] Training stopped", kind="complete")
                 tb.close()
                 return
@@ -145,61 +185,32 @@ def run_basic_training_loop(
             loss = loss / cfg.gradient_accumulation_steps
             loss.backward()
             accumulated_loss += loss.item()
-            del loss  # free scalar tensor immediately
+            del loss
             accumulation_step += 1
 
             if accumulation_step >= cfg.gradient_accumulation_steps:
-                torch.nn.utils.clip_grad_norm_(trainable_params, cfg.max_grad_norm)
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
-                global_step += 1
-
-                avg_loss = accumulated_loss * cfg.gradient_accumulation_steps / accumulation_step
-                _lr = scheduler.get_last_lr()[0]
-                if global_step % cfg.log_every == 0:
-                    tb.log_loss(avg_loss, global_step)
-                    tb.log_lr(_lr, global_step)
-                    yield TrainingUpdate(
-                        step=global_step, loss=avg_loss,
-                        msg=f"Epoch {epoch + 1}, Step {global_step}, Loss: {avg_loss:.4f}",
-                        kind="step", epoch=epoch + 1, max_epochs=cfg.max_epochs, lr=_lr,
-                        steps_per_epoch=steps_per_epoch,
-                    )
-
-                if global_step % cfg.log_heavy_every == 0:
-                    tb.log_per_layer_grad_norms(module.model, global_step)
-
+                global_step, avg_loss, updates = _flush_accumulated(
+                    trainable_params, optimizer, scheduler,
+                    accumulated_loss, accumulation_step, cfg, tb, module,
+                    epoch, global_step, steps_per_epoch,
+                )
+                yield from updates
                 epoch_loss += avg_loss
                 num_updates += 1
                 accumulated_loss = 0.0
                 accumulation_step = 0
 
-                # Periodic CUDA cache cleanup to prevent intra-epoch
-                # memory fragmentation on consumer GPUs.
                 if torch.cuda.is_available() and global_step % cfg.log_every == 0:
                     torch.cuda.empty_cache()
 
         # Flush remainder
         if accumulation_step > 0:
-            torch.nn.utils.clip_grad_norm_(trainable_params, cfg.max_grad_norm)
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad(set_to_none=True)
-            global_step += 1
-
-            avg_loss = accumulated_loss * cfg.gradient_accumulation_steps / accumulation_step
-            _lr = scheduler.get_last_lr()[0]
-            if global_step % cfg.log_every == 0:
-                tb.log_loss(avg_loss, global_step)
-                tb.log_lr(_lr, global_step)
-                yield TrainingUpdate(
-                    step=global_step, loss=avg_loss,
-                    msg=f"Epoch {epoch + 1}, Step {global_step}, Loss: {avg_loss:.4f}",
-                    kind="step", epoch=epoch + 1, max_epochs=cfg.max_epochs, lr=_lr,
-                    steps_per_epoch=steps_per_epoch,
-                )
-
+            global_step, avg_loss, updates = _flush_accumulated(
+                trainable_params, optimizer, scheduler,
+                accumulated_loss, accumulation_step, cfg, tb, module,
+                epoch, global_step, steps_per_epoch,
+            )
+            yield from updates
             epoch_loss += avg_loss
             num_updates += 1
             accumulated_loss = 0.0
@@ -224,8 +235,6 @@ def run_basic_training_loop(
                 checkpoint_path=ckpt_dir,
             )
 
-        # Clear CUDA cache AFTER checkpoint save so serialization
-        # temporaries are also freed.
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
